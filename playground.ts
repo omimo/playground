@@ -31,11 +31,11 @@ import {
 import {Example2D, shuffle} from "./dataset";
 import {AppendingLineChart} from "./linechart";
 
-var mainWidth;
+let mainWidth;
 
 // More scrolling
 d3.select(".more button").on("click", function() {
-  var position = 800;
+  let position = 800;
   d3.transition()
     .duration(1000)
     .tween("scroll", scrollTween(position));
@@ -43,15 +43,21 @@ d3.select(".more button").on("click", function() {
 
 function scrollTween(offset) {
   return function() {
-    var i = d3.interpolateNumber(window.pageYOffset || document.documentElement.scrollTop, offset);
+    let i = d3.interpolateNumber(window.pageYOffset ||
+        document.documentElement.scrollTop, offset);
     return function(t) { scrollTo(0, i(t)); };
   };
 }
 
 const RECT_SIZE = 30;
+const BIAS_SIZE = 5;
 const NUM_SAMPLES_CLASSIFY = 500;
 const NUM_SAMPLES_REGRESS = 1200;
 const DENSITY = 100;
+
+enum HoverType {
+  BIAS, WEIGHT
+}
 
 interface InputFeature {
   f: (x: number, y: number) => number;
@@ -72,6 +78,8 @@ let HIDABLE_CONTROLS = [
   ["Show test data", "showTestData"],
   ["Discretize output", "discretize"],
   ["Play button", "playButton"],
+  ["Step button", "stepButton"],
+  ["Reset button", "resetButton"],
   ["Learning rate", "learningRate"],
   ["Activation", "activation"],
   ["Regularization", "regularization"],
@@ -335,12 +343,19 @@ function makeGUI() {
   // Listen for css-responsive changes and redraw the svg network.
 
   window.addEventListener("resize", () => {
-    var newWidth = document.querySelector("#main-part").getBoundingClientRect().width;
+    let newWidth = document.querySelector("#main-part")
+        .getBoundingClientRect().width;
     if (newWidth !== mainWidth) {
       mainWidth = newWidth;
       drawNetwork(network);
       updateUI(true);
     }
+  });
+}
+
+function updateBiasesUI(network: nn.Node[][]) {
+  nn.forEachNode(network, true, node => {
+    d3.select(`rect#bias-${node.id}`).style("fill", colorScale(node.bias));
   });
 }
 
@@ -365,7 +380,7 @@ function updateWeightsUI(network: nn.Node[][], container: d3.Selection<any>) {
 }
 
 function drawNode(cx: number, cy: number, nodeId: string, isInput: boolean,
-    container: d3.Selection<any>) {
+    container: d3.Selection<any>, node?: nn.Node) {
   let x = cx - RECT_SIZE / 2;
   let y = cy - RECT_SIZE / 2;
 
@@ -418,6 +433,21 @@ function drawNode(cx: number, cy: number, nodeId: string, isInput: boolean,
       text.append("tspan").text(label);
     }
     nodeGroup.classed(activeOrNotClass, true);
+  }
+  if (!isInput) {
+    // Draw the node's bias.
+    nodeGroup.append("rect")
+      .attr({
+        id: `bias-${nodeId}`,
+        x: -BIAS_SIZE - 2,
+        y: RECT_SIZE - BIAS_SIZE + 3,
+        width: BIAS_SIZE,
+        height: BIAS_SIZE,
+      }).on("mouseenter", function() {
+        updateHoverCard(HoverType.BIAS, node, d3.mouse(container.node()));
+      }).on("mouseleave", function() {
+        updateHoverCard(null);
+      });
   }
 
   // Draw the node's canvas.
@@ -517,7 +547,7 @@ function drawNetwork(network: nn.Node[][]): void {
       let node = network[layerIdx][i];
       let cy = nodeIndexScale(i) + RECT_SIZE / 2;
       node2coord[node.id] = {cx: cx, cy: cy};
-      drawNode(cx, cy, node.id, false, container);
+      drawNode(cx, cy, node.id, false, container, node);
 
       // Show callout to thumbnails.
       let numNodes = network[layerIdx].length;
@@ -628,11 +658,58 @@ function addPlusMinusControl(x: number, layerIdx: number) {
   );
 }
 
+function updateHoverCard(type: HoverType, nodeOrLink?: nn.Node | nn.Link,
+    coordinates?: [number, number]) {
+  let hovercard = d3.select("#hovercard");
+  if (type == null) {
+    hovercard.style("display", "none");
+    d3.select("#svg").on("click", null);
+    return;
+  }
+  d3.select("#svg").on("click", () => {
+    hovercard.select(".value").style("display", "none");
+    let input = hovercard.select("input");
+    input.style("display", null);
+    input.on("input", function() {
+      if (this.value != null && this.value !== "") {
+        if (type == HoverType.WEIGHT) {
+          (<nn.Link>nodeOrLink).weight = +this.value;
+        } else {
+          (<nn.Node>nodeOrLink).bias = +this.value;
+        }
+        updateUI();
+      }
+    });
+    input.on("keypress", () => {
+      if ((<any>d3.event).keyCode == 13) {
+        updateHoverCard(type, nodeOrLink, coordinates);
+      }
+    });
+    (<HTMLInputElement>input.node()).focus();
+  });
+  let value = type == HoverType.WEIGHT ?
+    (<nn.Link>nodeOrLink).weight :
+    (<nn.Node>nodeOrLink).bias;
+  let name = type == HoverType.WEIGHT ? "Weight" : "Bias";
+  hovercard.style({
+    "left": `${coordinates[0] + 20}px`,
+    "top": `${coordinates[1]}px`,
+    "display": "block"
+  });
+  hovercard.select(".type").text(name);
+  hovercard.select(".value")
+    .style("display", null)
+    .text(value.toPrecision(2));
+  hovercard.select("input")
+    .property("value", value.toPrecision(2))
+    .style("display", "none");
+}
+
 function drawLink(
     input: nn.Link, node2coord: {[id: string]: {cx: number, cy: number}},
     network: nn.Node[][], container: d3.Selection<any>,
     isFirst: boolean, index: number, length: number) {
-  let line = container.append("path");
+  let line = container.insert("path", ":first-child");
   let source = node2coord[input.source.id];
   let dest = node2coord[input.dest.id];
   let datum = {
@@ -652,6 +729,17 @@ function drawLink(
     id: "link" + input.source.id + "-" + input.dest.id,
     d: diagonal(datum, 0)
   });
+
+  // Add an invisible thick link that will be used for
+  // showing the weight value on hover.
+  container.append("path")
+    .attr("d", diagonal(datum, 0))
+    .attr("class", "link-hover")
+    .on("mouseenter", function() {
+      updateHoverCard(HoverType.WEIGHT, input, d3.mouse(this));
+    }).on("mouseleave", function() {
+      updateHoverCard(null);
+    });
   return line;
 }
 
@@ -719,6 +807,8 @@ function getLoss(network: nn.Node[][], dataPoints: Example2D[]): number {
 function updateUI(firstStep = false) {
   // Update the links visually.
   updateWeightsUI(network, d3.select("g.core"));
+  // Update the bias values visually.
+  updateBiasesUI(network);
   // Get the decision boundary of the network.
   updateDecisionBoundary(network, firstStep);
   let selectedId = selectedNodeId != null ?
@@ -819,7 +909,7 @@ function reset() {
   let outputActivation = (state.problem == Problem.REGRESSION) ?
       nn.Activations.LINEAR : nn.Activations.TANH;
   network = nn.buildNetwork(shape, state.activation, outputActivation,
-      state.regularization, constructInputIds());
+      state.regularization, constructInputIds(), state.initZero);
   lossTrain = getLoss(network, trainData);
   lossTest = getLoss(network, testData);
   drawNetwork(network);
